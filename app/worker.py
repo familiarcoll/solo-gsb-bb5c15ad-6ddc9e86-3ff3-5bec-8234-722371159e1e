@@ -10,7 +10,7 @@ from .config import settings
 from .database import tx
 from .delivery_client import DeliveryClient
 
-STATUSES = ("pending", "in_flight", "delivered", "dead")
+STATUSES = ("pending", "in_flight", "delivered", "dead", "skipped")
 
 
 def utcnow() -> datetime:
@@ -32,6 +32,12 @@ class DeliveryWorker:
     is spent it moves to dead letters and the watermark steps over it so the
     tail can continue. Replayed dead events are delivered again but never
     move the watermark (they sit behind it).
+
+    Events that a subscription's declarative filter rejects are persisted as
+    ``skipped``. They are never POSTed, but they still own their sequence:
+    the watermark advances over a skipped head atomically, one sequence at a
+    time, and can never jump past a missing gap or overtake a predecessor
+    that is pending/in flight (e.g. retrying).
     """
 
     def __init__(self, db: aiosqlite.Connection) -> None:
@@ -110,12 +116,17 @@ class DeliveryWorker:
     async def pump_once(self) -> bool:
         """Release at most one attempt per eligible subscription head.
 
-        Returns True when at least one attempt was dispatched, signalling the
-        loop to pump again so a healthy backlog drains without idle delay.
+        Returns True when at least one attempt was dispatched or a
+        watermark advanced over skipped events, signalling the loop to pump
+        again so a healthy backlog drains without idle delay.
         """
+        # Skipped heads are advanced first so that, once a predecessor gap
+        # is resolved, skipped sequences move the watermark without an HTTP
+        # round trip.
+        advanced = await self._advance_skipped_heads()
         heads = await self._claim_heads()
         if not heads:
-            return False
+            return advanced
 
         dispatched = False
         tasks = []
@@ -128,7 +139,47 @@ class DeliveryWorker:
             dispatched = True
         if tasks:
             await asyncio.gather(*tasks)
-        return dispatched
+        return dispatched or advanced
+
+    async def _advance_skipped_heads(self) -> bool:
+        """Atomically step each watermark over skipped head sequences.
+
+        The UPDATE only fires when a delivery at exactly the subscription's
+        current ``next_seq`` exists and is ``skipped``: therefore it cannot
+        leap over a missing sequence (no row joins) nor overtake an
+        in-flight/retrying predecessor (its status differs). Each step moves
+        the watermark by exactly one sequence and loops until every
+        subscription's head is no longer skipped — all while holding the
+        connection write lock, so the progression is durable and crash-safe.
+        """
+        progressed = False
+        async with tx(self.db):
+            while True:
+                cur = await self.db.execute(
+                    """
+                    UPDATE subscriptions
+                       SET next_seq = next_seq + 1,
+                           cursor_seq =
+                             (SELECT e.sequence
+                                FROM deliveries d2
+                                JOIN events e ON e.id = d2.event_id
+                               WHERE d2.subscription_id = subscriptions.id
+                                 AND d2.status = 'skipped'
+                                 AND e.sequence = subscriptions.next_seq)
+                     WHERE EXISTS (
+                             SELECT 1
+                               FROM deliveries d2
+                               JOIN events e ON e.id = d2.event_id
+                              WHERE d2.subscription_id = subscriptions.id
+                                AND d2.status = 'skipped'
+                                AND e.sequence = subscriptions.next_seq
+                           )
+                    """
+                )
+                if cur.rowcount == 0:
+                    break
+                progressed = True
+        return progressed
 
     async def _attempt_guarded(
         self, lock: asyncio.Lock, row: aiosqlite.Row

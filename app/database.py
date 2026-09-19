@@ -54,6 +54,13 @@ async def init_db() -> aiosqlite.Connection:
     await conn.execute("PRAGMA synchronous=NORMAL")
     await conn.executescript(SCHEMA_PATH.read_text())
 
+    # Lightweight additive migration for databases created before declarative
+    # filters existed. Rows keep filter = NULL, which matches every event.
+    async with conn.execute("PRAGMA table_info(subscriptions)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    if "filter" not in columns:
+        await conn.execute("ALTER TABLE subscriptions ADD COLUMN filter TEXT")
+
     # Crash recovery: a process dying mid-send leaves in_flight rows.
     # Re-arm them so the head is retried instead of stalling forever.
     async with tx(conn):

@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at      TEXT NOT NULL,
     cursor_seq      INTEGER,
     next_seq        INTEGER NOT NULL DEFAULT 1,
+    filter          TEXT,
     UNIQUE(source, callback_url)
 );
 

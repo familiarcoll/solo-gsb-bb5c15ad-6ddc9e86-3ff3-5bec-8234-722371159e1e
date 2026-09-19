@@ -45,6 +45,9 @@ class Receiver:
         self.received: list[dict] = []
         self.fail_until: dict[str, int] = {}
         self.fail_sequences: dict[str, set[int]] = {}
+        # Sources with a stall Event hold every attempt open (in_flight)
+        # until the event is set; the held attempt then succeeds.
+        self.stall: dict[str, asyncio.Event] = {}
         self.lock = asyncio.Lock()
         self.events: dict[str, asyncio.Event] = {}
         self.transport = ASGITransport(app=self)
@@ -60,11 +63,16 @@ class Receiver:
         source = body["source"]
         sequence = body["sequence"]
 
-        fail_budget = self.fail_until.get(source, 0)
-        fail_seqs = self.fail_sequences.get(source, {1})
-        status = 200
-        if attempt <= fail_budget and sequence in fail_seqs:
-            status = 500
+        stall = self.stall.get(source)
+        if stall is not None:
+            await stall.wait()
+            status = 200
+        else:
+            fail_budget = self.fail_until.get(source, 0)
+            fail_seqs = self.fail_sequences.get(source, {1})
+            status = 200
+            if attempt <= fail_budget and sequence in fail_seqs:
+                status = 500
 
         async with self.lock:
             self.received.append(
@@ -141,12 +149,46 @@ async def client(monkeypatch, receiver, tmp_path):
 
 # --------------------------------------------------------------------- helpers
 
-async def subscribe(client, source="orders", url=RECEIVER_URL) -> dict:
-    r = await client.post(
-        "/subscriptions", json={"source": source, "callback_url": url}
-    )
+async def subscribe(client, source="orders", url=RECEIVER_URL, flt=None) -> dict:
+    body: dict[str, Any] = {"source": source, "callback_url": url}
+    if flt is not None:
+        body["filter"] = flt
+    r = await client.post("/subscriptions", json=body)
     assert r.status_code == 201, r.text
     return r.json()
+
+
+async def delivery_statuses(client, source="orders") -> list[tuple[int, str]]:
+    conn = app.state.db
+    async with conn.execute(
+        """
+        SELECT e.sequence, d.status
+          FROM deliveries d
+          JOIN subscriptions s ON s.id = d.subscription_id
+          JOIN events e ON e.id = d.event_id
+         WHERE e.source = ?
+         ORDER BY e.sequence
+        """,
+        (source,),
+    ) as cur:
+        return [(row[0], row[1]) for row in await cur.fetchall()]
+
+
+async def wait_next_seq(client, subscription_id, expected, timeout=5.0) -> None:
+    deadline = time.monotonic() + timeout
+    conn = app.state.db
+    while time.monotonic() < deadline:
+        async with conn.execute(
+            "SELECT next_seq FROM subscriptions WHERE id = ?",
+            (subscription_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None and row[0] >= expected:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"subscription {subscription_id} next_seq did not reach {expected}"
+    )
 
 
 async def send_event(client, source, sequence, event_id, payload=None):
@@ -408,3 +450,205 @@ async def test_backlog_shows_retry_schedule(client, receiver):
             break
         await asyncio.sleep(0.02)
     assert saw_retry
+
+
+# ------------------------------------------------------------------- filters
+
+EVENT_TYPE_FILTER = {"op": "in", "path": "type", "values": ["paid", "refunded"]}
+
+
+async def test_filter_matches_are_delivered_nonmatches_persisted_skipped(
+    client, receiver
+):
+    sub = await subscribe(client, flt=EVENT_TYPE_FILTER)
+
+    for seq, ptype in ((1, "paid"), (2, "viewed"), (3, "refunded"), (4, "other")):
+        r = await send_event(
+            client, "orders", seq, f"evt-{seq}", {"type": ptype}
+        )
+        assert r.status_code == 202
+        ack = r.json()
+        if ptype in ("paid", "refunded"):
+            assert ack["queued"] == 1 and ack["skipped"] == 0
+        else:
+            assert ack["queued"] == 0 and ack["skipped"] == 1
+
+    await wait_received(receiver, "orders", 1)
+    await wait_received(receiver, "orders", 3)
+    await wait_next_seq(client, sub["id"], 5)
+
+    assert delivered_sequences(receiver) == [1, 3]
+    assert await delivery_statuses(client) == [
+        (1, "delivered"),
+        (2, "skipped"),
+        (3, "delivered"),
+        (4, "skipped"),
+    ]
+
+    # Skipped rows are neither backlog nor dead letters.
+    assert (await client.get("/backlog", params={"source": "orders"})).json() == []
+    assert (
+        await client.get("/dead-letters", params={"source": "orders"})
+    ).json() == []
+
+
+async def test_subscription_create_and_list_return_filter(client):
+    sub = await subscribe(client, flt=EVENT_TYPE_FILTER)
+    assert sub["filter"] == EVENT_TYPE_FILTER
+
+    listed = (await client.get("/subscriptions", params={"source": "orders"})).json()
+    assert listed[0]["filter"] == EVENT_TYPE_FILTER
+
+
+async def test_missing_filter_matches_all(client, receiver):
+    sub = await subscribe(client)
+    assert sub["filter"] is None
+    await send_event(client, "orders", 1, "evt-1", {"anything": "goes"})
+    await wait_received(receiver, "orders", 1)
+    assert delivered_sequences(receiver) == [1]
+
+
+@pytest.mark.parametrize(
+    "bad_filter",
+    [
+        {"op": "bogus", "path": "a"},
+        {"op": "eq", "path": "a"},                      # missing value
+        {"op": "all", "filters": []},                   # empty combinator
+        {"op": "any", "filters": []},
+        {"op": "not", "filter": {"op": "not", "filter": {
+            "op": "not", "filter": {"op": "not", "filter": {
+                "op": "not", "filter": {
+                    "op": "not", "filter": {"op": "exists", "path": "a"},
+                }}}}}},                                  # depth 6
+    ],
+)
+async def test_invalid_filter_rejected_422(client, bad_filter):
+    r = await client.post(
+        "/subscriptions",
+        json={
+            "source": "orders",
+            "callback_url": RECEIVER_URL,
+            "filter": bad_filter,
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+async def test_skipped_head_does_not_overtake_retrying_predecessor(
+    client, receiver
+):
+    sub = await subscribe(client, flt=EVENT_TYPE_FILTER)
+    # Hold the first attempt at sequence 1 open (in_flight); the skipped #2
+    # must not leap over an in-flight/retrying predecessor.
+    stall = asyncio.Event()
+    receiver.stall["orders"] = stall
+
+    await send_event(client, "orders", 1, "evt-1", {"type": "paid"})
+    await send_event(client, "orders", 2, "evt-2", {"type": "viewed"})
+    await send_event(client, "orders", 3, "evt-3", {"type": "paid"})
+
+    # Wait until #1 is physically in flight, then give the pump time to
+    # wrongly advance over the skipped #2.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        statuses = await delivery_statuses(client)
+        if (1, "in_flight") in statuses:
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.3)
+    conn = app.state.db
+    async with conn.execute(
+        "SELECT next_seq FROM subscriptions WHERE id = ?", (sub["id"],)
+    ) as cur:
+        assert (await cur.fetchone())[0] == 1
+
+    # Release the held attempt: #1 succeeds, the watermark hops over #2 and
+    # #3 is delivered, without ever overtaking #1.
+    stall.set()
+    del receiver.stall["orders"]
+    await wait_received(receiver, "orders", 1)
+    await wait_received(receiver, "orders", 3)
+    await wait_next_seq(client, sub["id"], 4)
+    assert delivered_sequences(receiver) == [1, 3]
+    assert await delivery_statuses(client) == [
+        (1, "delivered"),
+        (2, "skipped"),
+        (3, "delivered"),
+    ]
+
+
+async def test_skipped_behind_missing_gap_holds_until_gap_fills(
+    client, receiver
+):
+    sub = await subscribe(client, flt=EVENT_TYPE_FILTER)
+
+    # #1 is missing; #2 is skipped, #3 matches and buffers.
+    await send_event(client, "orders", 2, "evt-2", {"type": "viewed"})
+    await send_event(client, "orders", 3, "evt-3", {"type": "paid"})
+
+    await asyncio.sleep(0.2)
+    conn = app.state.db
+    async with conn.execute(
+        "SELECT next_seq FROM subscriptions WHERE id = ?", (sub["id"],)
+    ) as cur:
+        assert (await cur.fetchone())[0] == 1
+
+    # Filling the gap lets the watermark hop over #2 (skipped) and
+    # immediately deliver #3.
+    await send_event(client, "orders", 1, "evt-1", {"type": "paid"})
+    await wait_received(receiver, "orders", 1)
+    await wait_received(receiver, "orders", 3)
+    await wait_next_seq(client, sub["id"], 4)
+    assert delivered_sequences(receiver) == [1, 3]
+
+
+async def test_composite_not_filter_evaluation(client, receiver):
+    flt = {
+        "op": "all",
+        "filters": [
+            {"op": "exists", "path": "order.id"},
+            {
+                "op": "not",
+                "filter": {"op": "eq", "path": "order.test", "value": True},
+            },
+        ],
+    }
+    await subscribe(client, flt=flt)
+
+    await send_event(client, "orders", 1, "evt-1", {"order": {"id": "a"}})
+    await send_event(
+        client, "orders", 2, "evt-2", {"order": {"id": "b", "test": True}}
+    )
+    await send_event(client, "orders", 3, "evt-3", {"nope": True})
+
+    await wait_received(receiver, "orders", 1)
+    await asyncio.sleep(0.2)
+    assert delivered_sequences(receiver) == [1]
+    assert await delivery_statuses(client) == [
+        (1, "delivered"),
+        (2, "skipped"),
+        (3, "skipped"),
+    ]
+
+
+async def test_skipped_after_dead_predecessor_advances(client):
+    # A dead matching predecessor is stepped over; following skipped events
+    # then advance the watermark and never appear as dead letters/backlog.
+    sub = await subscribe(client, flt=EVENT_TYPE_FILTER)
+    receiver.fail_until["orders"] = 99
+    await send_event(client, "orders", 1, "evt-1", {"type": "paid"})
+    await send_event(client, "orders", 2, "evt-2", {"type": "viewed"})
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        dead = (await client.get("/dead-letters", params={"source": "orders"})).json()
+        if dead:
+            break
+        await asyncio.sleep(0.05)
+    assert [d["sequence"] for d in dead] == [1]
+    await wait_next_seq(client, sub["id"], 3)
+
+    assert await delivery_statuses(client) == [(1, "dead"), (2, "skipped")]
+    assert (
+        await client.get("/backlog", params={"source": "orders"})
+    ).json() == []
