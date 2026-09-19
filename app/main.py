@@ -7,6 +7,7 @@ import aiosqlite
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from .database import init_db, tx, utcnow_iso
+from .filtering import matches as filter_matches
 from .models import (
     DeliveryOut,
     EventAck,
@@ -93,6 +94,7 @@ async def create_subscription(
         raise HTTPException(status_code=422, detail="callback_url must be http(s)")
 
     now = utcnow_iso()
+    filter_json = json.dumps(body.filter) if body.filter is not None else None
     async with tx(conn):
         # New subscribers only see events ingested from now on. Start their
         # watermark just beyond the highest sequence already known for the
@@ -107,10 +109,10 @@ async def create_subscription(
             cur = await conn.execute(
                 """
                 INSERT INTO subscriptions
-                    (source, callback_url, created_at, cursor_seq, next_seq)
-                VALUES (?, ?, ?, NULL, ?)
+                    (source, callback_url, "filter", created_at, cursor_seq, next_seq)
+                VALUES (?, ?, ?, ?, NULL, ?)
                 """,
-                (body.source, url, now, next_seq),
+                (body.source, url, filter_json, now, next_seq),
             )
         except aiosqlite.IntegrityError:
             raise HTTPException(
@@ -125,6 +127,7 @@ async def create_subscription(
         callback_url=url,
         next_seq=next_seq,
         cursor_seq=None,
+        filter=body.filter,
         created_at=now,
     )
 
@@ -148,7 +151,14 @@ async def list_subscriptions(
         args = ()
     async with conn.execute(sql, args) as cur:
         rows = await cur.fetchall()
-    return [SubscriptionOut(**dict(r)) for r in rows]
+    return [_subscription_out(r) for r in rows]
+
+
+def _subscription_out(row: aiosqlite.Row) -> SubscriptionOut:
+    data = dict(row)
+    raw = data.get("filter")
+    data["filter"] = json.loads(raw) if raw else None
+    return SubscriptionOut(**data)
 
 
 @app.delete(
@@ -220,21 +230,31 @@ async def ingest_event(
 
         queued = 0
         async with conn.execute(
-            "SELECT id FROM subscriptions WHERE source = ?", (body.source,)
+            'SELECT id, "filter" FROM subscriptions WHERE source = ?',
+            (body.source,),
         ) as cur:
             subs = await cur.fetchall()
         for sub in subs:
+            # Declarative filter: matching events queue for delivery as usual;
+            # non-matching ones are persisted as 'skipped' so the worker can
+            # step the watermark over them once they become the head — without
+            # this the filtered sequence would leave a permanent gap.
+            spec = json.loads(sub["filter"]) if sub["filter"] else None
+            status = (
+                "pending" if filter_matches(spec, body.payload) else "skipped"
+            )
             try:
                 await conn.execute(
                     """
                     INSERT INTO deliveries
                         (subscription_id, event_id, status, attempts,
                          next_attempt_at, last_error, created_at, updated_at)
-                    VALUES (?, ?, 'pending', 0, NULL, NULL, ?, ?)
+                    VALUES (?, ?, ?, 0, NULL, NULL, ?, ?)
                     """,
-                    (sub["id"], event_pk, now, now),
+                    (sub["id"], event_pk, status, now, now),
                 )
-                queued += 1
+                if status == "pending":
+                    queued += 1
             except aiosqlite.IntegrityError:
                 # Row already queued (e.g. duplicate ingest racing a retry).
                 pass

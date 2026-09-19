@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     source          TEXT NOT NULL,
     callback_url    TEXT NOT NULL,
+    "filter"        TEXT,
     created_at      TEXT NOT NULL,
     cursor_seq      INTEGER,
     next_seq        INTEGER NOT NULL DEFAULT 1,

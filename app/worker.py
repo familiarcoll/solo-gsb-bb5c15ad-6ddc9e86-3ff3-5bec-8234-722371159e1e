@@ -10,7 +10,7 @@ from .config import settings
 from .database import tx
 from .delivery_client import DeliveryClient
 
-STATUSES = ("pending", "in_flight", "delivered", "dead")
+STATUSES = ("pending", "in_flight", "delivered", "dead", "skipped")
 
 
 def utcnow() -> datetime:
@@ -32,6 +32,12 @@ class DeliveryWorker:
     is spent it moves to dead letters and the watermark steps over it so the
     tail can continue. Replayed dead events are delivered again but never
     move the watermark (they sit behind it).
+
+    Subscriptions with a payload filter persist non-matching events as
+    ``skipped``. A skipped event still occupies its sequence number, so once
+    it becomes the head (sequence == next_seq) the watermark steps over it
+    atomically — never earlier, so a retrying predecessor is never jumped
+    and filtered sequences leave no permanent gap.
     """
 
     def __init__(self, db: aiosqlite.Connection) -> None:
@@ -113,9 +119,12 @@ class DeliveryWorker:
         Returns True when at least one attempt was dispatched, signalling the
         loop to pump again so a healthy backlog drains without idle delay.
         """
+        # Step watermarks over skipped heads first: a filtered event at
+        # next_seq would otherwise block its successors forever.
+        advanced = await self._advance_skipped()
         heads = await self._claim_heads()
         if not heads:
-            return False
+            return advanced
 
         dispatched = False
         tasks = []
@@ -128,7 +137,61 @@ class DeliveryWorker:
             dispatched = True
         if tasks:
             await asyncio.gather(*tasks)
-        return dispatched
+        return dispatched or advanced
+
+    async def _advance_skipped(self) -> bool:
+        """Move each subscription watermark past skipped deliveries.
+
+        Only a skipped delivery sitting exactly at ``next_seq`` is stepped
+        over; sequences below the watermark may still be retrying and must
+        never be jumped. Consecutive skipped sequences fold into one atomic
+        update per subscription. Returns True if any watermark moved.
+        """
+        async with tx(self.db):
+            async with self.db.execute(
+                """
+                SELECT s.id AS subscription_id, s.next_seq AS next_seq
+                  FROM subscriptions s
+                  JOIN deliveries d ON d.subscription_id = s.id
+                  JOIN events e ON e.id = d.event_id
+                 WHERE d.status = 'skipped'
+                   AND e.sequence = s.next_seq
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+
+            advanced = False
+            for row in rows:
+                sub_id = row["subscription_id"]
+                seq = row["next_seq"]
+                while await self._is_skipped_at(sub_id, seq):
+                    seq += 1
+                if seq == row["next_seq"]:
+                    continue
+                cur = await self.db.execute(
+                    """
+                    UPDATE subscriptions
+                       SET next_seq = ?, cursor_seq = ?
+                     WHERE id = ? AND next_seq = ?
+                    """,
+                    (seq, seq - 1, sub_id, row["next_seq"]),
+                )
+                advanced = advanced or cur.rowcount > 0
+        return advanced
+
+    async def _is_skipped_at(self, subscription_id: int, sequence: int) -> bool:
+        async with self.db.execute(
+            """
+            SELECT 1
+              FROM deliveries d
+              JOIN events e ON e.id = d.event_id
+             WHERE d.subscription_id = ?
+               AND d.status = 'skipped'
+               AND e.sequence = ?
+            """,
+            (subscription_id, sequence),
+        ) as cur:
+            return await cur.fetchone() is not None
 
     async def _attempt_guarded(
         self, lock: asyncio.Lock, row: aiosqlite.Row
